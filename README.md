@@ -7,7 +7,7 @@ mettaur the goat
 ## Instructions
 1. Download/clone repo
 2. Choose whatever map .xblock you want to use and put it in /resources/, then rename it to map.xblock
-3. Extract "Textures.m2d" contents and put contents in /resources/textures, so when you enter the "textures" folder you should be able to see "cave", "common", "effect" etc.
+3. Extract "Textures.m2d" contents and put contents in /resources/textures if a textures folder doesn't exist make one, so when you enter the "textures" folder you should be able to see "cave", "common", "effect" etc.
 4. Build, run the .exe, enjoy buggy mess
 
 ## To-do
