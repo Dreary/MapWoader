@@ -1,0 +1,2043 @@
+#include "NifParser.h"
+
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <cstring>
+#include <iostream>
+#include <iomanip>
+
+#include <Engine/Math/Vector3S.h>
+#include <Engine/Math/Vector2S.h>
+#include <Engine/Math/Matrix4.h>
+#include <Engine/Math/Quaternion.h>
+#include <Engine/Assets/ParserUtils.h>
+#include <Engine/Objects/Transform.h>
+
+#include <Engine/VulkanGraphics/Scene/MeshData.h>
+#include "NifComponentInfo.h"
+#include "NifBlockTypes.h"
+
+void NifDocument::ParseMatrix(std::string_view &stream, Matrix4F &matrix)
+{
+	for (int x = 0; x < 3; ++x)
+	{
+		for (int y = 0; y < 3; ++y)
+		{
+			matrix.Data[y][x] = Endian.read<float>(stream);
+		}
+	}
+}
+
+Vector3SF NifDocument::ParseVector3(std::string_view &stream)
+{
+	Vector3SF vector;
+
+	float x = Endian.read<float>(stream);
+	float y = Endian.read<float>(stream);
+	float z = Endian.read<float>(stream);
+
+	return Vector3SF(x, y, z);
+}
+
+void NifDocument::ParseTransform(std::string_view &stream, NiTransform &transform, bool translationFirst, bool isQuaternion)
+{
+	if (translationFirst)
+	{
+		float x = Endian.read<float>(stream);
+		float y = Endian.read<float>(stream);
+		float z = Endian.read<float>(stream);
+
+		transform.Translation = Vector3SF(z, y, x);
+	}
+
+	if (!isQuaternion)
+	{
+		ParseMatrix(stream, transform.Rotation);
+	}
+	else
+	{
+		float w = Endian.read<float>(stream);
+		float x = Endian.read<float>(stream);
+		float y = Endian.read<float>(stream);
+		float z = Endian.read<float>(stream);
+
+		transform.Rotation = Quaternion(w, x, y, z).MatrixF();
+	}
+
+	if (!translationFirst)
+	{
+		float z = Endian.read<float>(stream);
+		float y = Endian.read<float>(stream);
+		float x = Endian.read<float>(stream);
+
+		transform.Translation = Vector3SF(z, y, x);
+	}
+
+	std::swap(transform.Translation.X, transform.Translation.Z);
+
+	transform.Scale = Endian.read<float>(stream);
+}
+
+void NifDocument::ParseBounds(std::string_view &stream, NiBounds &bounds)
+{
+	float z = Endian.read<float>(stream);
+	float y = Endian.read<float>(stream);
+	float x = Endian.read<float>(stream);
+
+	bounds.Center = Vector3SF(x, y, z);
+	bounds.Radius = Endian.read<float>(stream);
+
+	std::swap(bounds.Center.X, bounds.Center.Z);
+}
+
+void NifDocument::ParseNode(std::string_view &stream, BlockData &block)
+{
+	NiNode *data = block.AddData<NiNode>();
+
+	unsigned int numExtraData = Endian.read<unsigned int>(stream);
+
+	data->ExtraData.resize(numExtraData);
+
+	for (unsigned int i = 0; i < numExtraData; ++i)
+		data->ExtraData[i] = &Blocks[Endian.read<unsigned int>(stream)];
+
+	data->Controller = FetchRef(stream);
+	data->Flags = Endian.read<unsigned short>(stream);
+
+	ParseTransform(stream, data->Transformation);
+
+	unsigned int numProperties = Endian.read<unsigned int>(stream);
+
+	data->Properties.resize(numProperties);
+
+	for (unsigned int i = 0; i < numProperties; ++i)
+		data->Properties[i] = &Blocks[Endian.read<unsigned int>(stream)];
+
+	data->CollisionObject = FetchRef(stream);
+
+	unsigned int numChildren = Endian.read<unsigned int>(stream);
+
+	data->Children.resize(numChildren);
+
+	for (unsigned int i = 0; i < numChildren; ++i)
+	{
+		unsigned int childIndex = Endian.read<unsigned int>(stream);
+
+		if (childIndex != (unsigned int)-1)
+			data->Children[i] = &Blocks[childIndex];
+	}
+
+	unsigned int numEffects = Endian.read<unsigned int>(stream);
+
+	data->Effects.resize(numEffects);
+
+	for (unsigned int i = 0; i < numEffects; ++i)
+		data->Effects[i] = &Blocks[Endian.read<unsigned int>(stream)];
+}
+
+void NifDocument::ParseMesh(std::string_view &stream, BlockData &block)
+{
+	NiMesh *data = block.AddData<NiMesh>();
+
+	unsigned int numExtraData = Endian.read<unsigned int>(stream);
+
+	data->ExtraData.resize(numExtraData);
+
+	for (unsigned int i = 0; i < numExtraData; ++i)
+		data->ExtraData[i] = &Blocks[Endian.read<unsigned int>(stream)];
+
+	data->Controller = FetchRef(stream);
+	data->Flags = Endian.read<unsigned short>(stream);
+
+	ParseTransform(stream, data->Transformation);
+
+	unsigned int numProperties = Endian.read<unsigned int>(stream);
+
+	data->Properties.resize(numProperties);
+
+	for (unsigned int i = 0; i < numProperties; ++i)
+		data->Properties[i] = &Blocks[Endian.read<unsigned int>(stream)];
+
+	data->CollisionObject = FetchRef(stream);
+
+	unsigned int numMaterials = Endian.read<unsigned int>(stream);
+
+	data->Materials.resize(numMaterials);
+	data->MaterialExtraData.resize(numMaterials);
+
+	for (unsigned int i = 0; i < numMaterials; ++i)
+		data->Materials[i] = Strings[Endian.read<unsigned int>(stream)];
+
+	for (unsigned int i = 0; i < numMaterials; ++i)
+		data->MaterialExtraData[i] = FetchRef(stream);
+
+	data->ActiveMaterial = Endian.read<unsigned int>(stream);
+	data->MaterialNeedsUpdate = Endian.read<char>(stream);
+	data->PrimitiveType = (MeshPrimitiveType)Endian.read<unsigned int>(stream);
+	data->NumSubmeshes = Endian.read<unsigned short>(stream);
+	data->InstancingEnabled = Endian.read<char>(stream);
+
+	ParseBounds(stream, data->Bounds);
+
+	unsigned int numDataStreams = Endian.read<unsigned int>(stream);
+
+	data->Streams.resize(numDataStreams);
+
+	for (unsigned int i = 0; i < numDataStreams; ++i)
+	{
+		data->Streams[i].Stream = FetchRef(stream);
+		data->Streams[i].IsPerInstance = Endian.read<char>(stream);
+
+		unsigned short numSubMeshes = Endian.read<unsigned short>(stream);
+
+		data->Streams[i].SubmeshToRegionMap.resize(numSubMeshes);
+
+		for (unsigned short j = 0; j < numSubMeshes; ++j)
+			data->Streams[i].SubmeshToRegionMap[j] = Endian.read<unsigned short>(stream);
+
+		unsigned int numSemantics = Endian.read<unsigned int>(stream);
+
+		data->Streams[i].ComponentSemantics.resize(numSemantics);
+
+		for (unsigned int j = 0; j < numSemantics; ++j)
+		{
+			data->Streams[i].ComponentSemantics[j].Name = Strings[Endian.read<unsigned int>(stream)];
+			data->Streams[i].ComponentSemantics[j].Index = Endian.read<unsigned int>(stream);
+		}
+	}
+
+	unsigned int numModifiers = Endian.read<unsigned int>(stream);
+
+	data->Modifiers.resize(numModifiers);
+
+	for (unsigned int i = 0; i < numModifiers; ++i)
+		data->Modifiers[i] = FetchRef(stream);
+}
+
+void NifDocument::ParseTexturingProperty(std::string_view &stream, BlockData &block)
+{
+	NiTexturingProperty *data = block.AddData<NiTexturingProperty>();
+
+	auto readTextureData = [&](NiTexturingProperty::TextureData &data)
+	{
+		data.HasThisTexture = Endian.read<char>(stream);
+
+		if (!data.HasThisTexture)
+			return;
+
+		data.Source = FetchRef(stream);
+		data.Flags = Endian.read<unsigned short>(stream);
+		data.MaxAnisotropy = Endian.read<unsigned short>(stream);
+		data.HasTextureTransform = Endian.read<char>(stream);
+
+		if (data.HasTextureTransform)
+		{
+			float x = Endian.read<float>(stream);
+			float y = Endian.read<float>(stream);
+
+			data.Translation.Set(x, y);
+
+			x = Endian.read<float>(stream);
+			y = Endian.read<float>(stream);
+
+			data.Scale.Set(x, y);
+			data.Rotation = Endian.read<float>(stream);
+			data.TransformMethod = Endian.read<unsigned int>(stream);
+
+			x = Endian.read<float>(stream);
+			y = Endian.read<float>(stream);
+
+			data.Center.Set(x, y);
+		}
+	};
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->Flags = Endian.read<unsigned short>(stream);
+	data->TextureCount = Endian.read<unsigned int>(stream);
+
+	readTextureData(data->BaseTexture);
+	readTextureData(data->DarkTexture);
+	readTextureData(data->DetailTexture);
+	readTextureData(data->GlossTexture);
+	readTextureData(data->GlowTexture);
+	readTextureData(data->BumpTexture);
+
+	if (data->BumpTexture.HasThisTexture)
+	{
+		data->BumpMapLumaScale = Endian.read<float>(stream);
+		data->BumpMapLumaOffset = Endian.read<float>(stream);
+
+		float x = Endian.read<float>(stream);
+		float y = Endian.read<float>(stream);
+
+		data->BumpMapRight.Set(x, y);
+
+		x = Endian.read<float>(stream);
+		y = Endian.read<float>(stream);
+
+		data->BumpMapUp.Set(x, y);
+	}
+
+	readTextureData(data->NormalTexture);
+	readTextureData(data->ParallaxTexture);
+	readTextureData(data->Decal0Texture);
+
+	unsigned int shaderTextureCount = Endian.read<unsigned int>(stream);
+
+	data->ShaderTextures.resize(shaderTextureCount);
+
+	for (unsigned int i = 0; i < shaderTextureCount; ++i)
+	{
+		readTextureData(data->ShaderTextures[i].Map);
+
+		if (data->ShaderTextures[i].Map.HasThisTexture)
+			data->ShaderTextures[i].MapId = Endian.read<unsigned int>(stream);
+	}
+}
+
+void NifDocument::ParseSourceTexture(std::string_view &stream, BlockData &block)
+{
+	NiSourceTexture *data = block.AddData<NiSourceTexture>();
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->UseExternal = Endian.read<unsigned char>(stream);
+
+	unsigned int name = Endian.read<unsigned int>(stream);
+
+	if (name != 0xFFFFFFFFu)
+		data->FileName = Strings[name];
+
+	data->PixelData = FetchRef(stream);
+	data->PixelLayout = Endian.read<unsigned int>(stream);
+	data->UseMipmaps = Endian.read<unsigned int>(stream);
+	data->AlphaFormat = Endian.read<unsigned int>(stream);
+	data->IsStatic = Endian.read<unsigned char>(stream);
+	data->DirectRender = Endian.read<unsigned char>(stream);
+	data->PersistRenderData = Endian.read<unsigned char>(stream);
+}
+
+void NifDocument::ParseStream(std::string_view &stream, BlockData &block)
+{
+	NiDataStream *data = block.AddData<NiDataStream>();
+
+	data->Usage = (StreamUsage)(block.BlockType[13] - '0'); // they embedded both Usage and Access in the name, ew
+	data->StreamSize = Endian.read<unsigned int>(stream);
+	data->CloningBehavior = (CloningBehavior)Endian.read<unsigned int>(stream);
+
+	unsigned int numRegions = Endian.read<unsigned int>(stream);
+
+	data->Regions.resize(numRegions);
+
+	for (unsigned int i = 0; i < numRegions; ++i)
+	{
+		data->Regions[i].StartIndex = Endian.read<unsigned int>(stream);
+		data->Regions[i].NumIndices = Endian.read<unsigned int>(stream);
+	}
+
+	unsigned int numComponents = Endian.read<unsigned int>(stream);
+
+	data->ComponentFormats.resize(numComponents);
+	data->Attributes.resize(numComponents);
+
+	for (unsigned int i = 0; i < numComponents; ++i)
+	{
+		data->ComponentFormats[i] = (ComponentFormat)Endian.read<unsigned int>(stream);
+
+		auto index = ComponentInfo.find(data->ComponentFormats[i]);
+
+		if (index != ComponentInfo.end())
+		{
+			data->Attributes[i].Type = index->second.DataType;
+			data->Attributes[i].ElementCount = index->second.ElementCount;
+		}
+		else
+		{
+			data->Attributes[i].Type = Enum::AttributeDataType::Unknown;
+			data->Attributes[i].ElementCount = 0;
+		}
+	}
+
+	data->StreamData.resize(data->StreamSize);
+
+	size_t amount = std::min((size_t)data->StreamSize, stream.size());
+
+	std::memcpy(data->StreamData.data(), stream.data(), amount);
+	advanceStream(stream, amount);
+
+	data->Streamable = Endian.read<char>(stream);
+}
+
+Color3 NifDocument::ParseColor3(std::string_view &stream)
+{
+	float r = Endian.read<float>(stream);
+	float g = Endian.read<float>(stream);
+	float b = Endian.read<float>(stream);
+
+	return Color3(r, g, b);
+}
+
+Color4 NifDocument::ParseColor4(std::string_view &stream)
+{
+	float r = Endian.read<float>(stream);
+	float g = Endian.read<float>(stream);
+	float b = Endian.read<float>(stream);
+	float a = Endian.read<float>(stream);
+
+	return Color4(r, g, b, a);
+}
+
+void NifDocument::ParseMaterialProperty(std::string_view &stream, BlockData &block)
+{
+	NiMaterialProperty *data = block.AddData<NiMaterialProperty>();
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->AmbientColor = ParseColor3(stream);
+	data->DiffuseColor = ParseColor3(stream);
+	data->SpecularColor = ParseColor3(stream);
+	data->EmissiveColor = ParseColor3(stream);
+	data->Glossiness = Endian.read<float>(stream);
+	data->Alpha = Endian.read<float>(stream);
+}
+
+void NifDocument::ParseSkinningMeshModifier(std::string_view &stream, BlockData &block)
+{
+	NiSkinningMeshModifier *data = block.AddData<NiSkinningMeshModifier>();
+
+	unsigned int numSubmitPoints = Endian.read<unsigned int>(stream);
+
+	for (unsigned int i = 0; i < numSubmitPoints; ++i)
+		data->SubmitPoints.push_back(Endian.read<unsigned short>(stream));
+
+	unsigned int numCompletePoints = Endian.read<unsigned int>(stream);
+
+	for (unsigned int i = 0; i < numCompletePoints; ++i)
+		data->CompletePoints.push_back(Endian.read<unsigned short>(stream));
+
+	data->Flags = Endian.read<unsigned short>(stream);
+	data->SkeletonRoot = FetchRef(stream);
+
+	ParseTransform(stream, data->SkeletonTransformation, false);
+
+	unsigned int numBones = Endian.read<unsigned int>(stream);
+
+	for (unsigned int i = 0; i < numBones; ++i)
+		data->Bones.push_back(FetchRef(stream));
+
+	for (unsigned int i = 0; i < numBones; ++i)
+	{
+		data->BoneTransforms.push_back(NiTransform{});
+
+		ParseTransform(stream, data->BoneTransforms.back(), false);
+	}
+
+	for (unsigned int i = 0; i < numBones; ++i)
+	{
+		data->BoneBounds.push_back(NiBounds{});
+
+		ParseBounds(stream, data->BoneBounds.back());
+	}
+}
+
+void NifDocument::ParseSequenceData(std::string_view &stream, BlockData &block)
+{
+	NiSequenceData *data = block.AddData<NiSequenceData>();
+
+	unsigned int numEvaluators = Endian.read<unsigned int>(stream);
+
+	data->Evaluators.resize(numEvaluators);
+
+	for (unsigned int i = 0; i < numEvaluators; ++i)
+		data->Evaluators[i] = FetchRef(stream);
+
+	data->TextKeys = FetchRef(stream);
+	data->Duration = Endian.read<float>(stream);
+	data->CycleType = (CycleType)Endian.read<unsigned int>(stream);
+	data->Frequency = Endian.read<float>(stream);
+
+	unsigned int name = Endian.read<unsigned int>(stream);
+
+	if (name != 0xFFFFFFFFu)
+		data->AccumRootName = Strings[name];
+
+	data->AccumFlags = (AccumFlags)Endian.read<unsigned int>(stream);
+}
+
+void NifDocument::ParseEvaluator(std::string_view &stream, BlockData &block, NiEvaluator *data)
+{
+	data->NodeName = FetchString(stream);
+	data->PropertyType = FetchString(stream);
+	data->ControllerType = FetchString(stream);
+	data->ControllerId = FetchString(stream);
+	data->InterpolatorId = FetchString(stream);
+
+	unsigned char positionChannel = Endian.read<unsigned char>(stream);
+	unsigned char rotationChannel = Endian.read<unsigned char>(stream);
+	unsigned char scaleChannel = Endian.read<unsigned char>(stream);
+	unsigned char flags = Endian.read<unsigned char>(stream);
+
+	data->PositionPosed = positionChannel & 0x40;
+	data->PositionChannel = (ChannelType)(positionChannel & 0x2F);
+	data->RotationPosed = rotationChannel & 0x40;
+	data->RotationChannel = (ChannelType)(rotationChannel & 0x2F);
+	data->ScalePosed = scaleChannel & 0x40;
+	data->ScaleChannel = (ChannelType)(scaleChannel & 0x2F);
+
+	data->ChannelFlags = (ChannelTypeFlags)flags;
+}
+
+void NifDocument::ParseBSplineCompTransformEvaluator(std::string_view &stream, BlockData &block)
+{
+	NiBSplineCompTransformEvaluator *data = block.AddData<NiBSplineCompTransformEvaluator>();
+
+	ParseEvaluator(stream, block, data);
+
+	data->StartTime = Endian.read<float>(stream);
+	data->EndTime = Endian.read<float>(stream);
+	data->Data = FetchRef(stream);
+	data->BasisData = FetchRef(stream);
+
+	ParseTransform(stream, data->Transform, true, true);
+
+	data->TranslationHandle = Endian.read<unsigned int>(stream);
+	data->RotationHandle = Endian.read<unsigned int>(stream);
+	data->ScaleHandle = Endian.read<unsigned int>(stream);
+	data->TranslationOffset = Endian.read<float>(stream);
+	data->TranslationHalfRange = Endian.read<float>(stream);
+	data->RotationOffset = Endian.read<float>(stream);
+	data->RotationHalfRange = Endian.read<float>(stream);
+	data->ScaleOffset = Endian.read<float>(stream);
+	data->ScaleHalfRange = Endian.read<float>(stream);
+}
+
+void NifDocument::ParseBSplineData(std::string_view &stream, BlockData &block)
+{
+	NiBSplineData *data = block.AddData<NiBSplineData>();
+
+	unsigned int numFloatControlPoints = Endian.read<unsigned int>(stream);
+
+	data->FloatControlPoints.resize(numFloatControlPoints);
+
+	for (unsigned int i = 0; i < numFloatControlPoints; ++i)
+		data->FloatControlPoints[i] = Endian.read<float>(stream);
+
+	unsigned int numCompactControlPoints = Endian.read<unsigned int>(stream);
+
+	data->CompactControlPoints.resize(numCompactControlPoints);
+
+	for (unsigned int i = 0; i < numCompactControlPoints; ++i)
+		data->CompactControlPoints[i] = Endian.read<short>(stream);
+}
+
+void NifDocument::ParseBSplineBasisData(std::string_view &stream, BlockData &block)
+{
+	NiBSplineBasisData *data = block.AddData<NiBSplineBasisData>();
+
+	data->NumControlPoints = Endian.read<unsigned int>(stream);
+}
+
+void NifDocument::ParseTransformEvaluator(std::string_view &stream, BlockData &block)
+{
+	NiTransformEvaluator *data = block.AddData<NiTransformEvaluator>();
+
+	ParseEvaluator(stream, block, data);
+	ParseTransform(stream, data->Value, true, true);
+
+	data->Data = FetchRef(stream);
+}
+
+template <>
+float ParseKey<float>(NifDocument *document, std::string_view &stream)
+{
+	return document->Endian.read<float>(stream);
+}
+
+template <>
+Quaternion ParseKey<Quaternion>(NifDocument *document, std::string_view &stream)
+{
+	float w = document->Endian.read<float>(stream);
+	float x = document->Endian.read<float>(stream);
+	float y = document->Endian.read<float>(stream);
+	float z = document->Endian.read<float>(stream);
+
+	return Quaternion(w, x, y, z);
+}
+
+template <>
+Vector3SF ParseKey<Vector3SF>(NifDocument *document, std::string_view &stream)
+{
+	float x = document->Endian.read<float>(stream);
+	float y = document->Endian.read<float>(stream);
+	float z = document->Endian.read<float>(stream);
+
+	return Vector3F(x, y, z);
+}
+
+void NifDocument::ParseTransformData(std::string_view &stream, BlockData &block)
+{
+	NiTransformData *data = block.AddData<NiTransformData>();
+
+	data->RotationKeys.Parse(this, stream);
+	data->TranslationKeys.Parse(this, stream);
+	data->ScaleKeys.Parse(this, stream);
+}
+
+void NifDocument::ParseTextKeyExtraData(std::string_view &stream, BlockData &block)
+{
+	NiTextKeyExtraData *data = block.AddData<NiTextKeyExtraData>();
+
+	unsigned int length = Endian.read<unsigned int>(stream);
+
+	data->TextKeys.resize(length);
+
+	for (unsigned int i = 0; i < length; ++i)
+	{
+		data->TextKeys[i].Time = Endian.read<float>(stream);
+		data->TextKeys[i].Value = FetchString(stream);
+	}
+}
+
+void NifDocument::ParseColorExtraData(std::string_view &stream, BlockData &block)
+{
+	NiColorExtraData *data = block.AddData<NiColorExtraData>();
+
+	data->Value = ParseColor4(stream);
+}
+
+void NifDocument::ParseFloatExtraData(std::string_view &stream, BlockData &block)
+{
+	NiFloatExtraData *data = block.AddData<NiFloatExtraData>();
+
+	data->Value = Endian.read<float>(stream);
+}
+
+void NifDocument::ParseAlphaProperty(std::string_view &stream, BlockData &block)
+{
+	NiAlphaProperty *data = block.AddData<NiAlphaProperty>();
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->Flags = Endian.read<unsigned short>(stream);
+	data->Threshold = Endian.read<unsigned char>(stream);
+}
+
+void NifDocument::ParseVertexColorProperty(std::string_view &stream, BlockData &block)
+{
+	NiVertexColorProperty *data = block.AddData<NiVertexColorProperty>();
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->Flags = Endian.read<unsigned short>(stream);
+}
+
+void NifDocument::ParsePhysXProp(std::string_view &stream, BlockData &block)
+{
+	NiPhysXProp *data = block.AddData<NiPhysXProp>();
+
+	ReadBlockRefs(stream, block, data->ExtraData);
+
+	data->Controller = FetchRef(stream);
+	data->PhysXToWorldScale = Endian.read<float>(stream);
+
+	ReadBlockRefs(stream, block, data->Sources);
+	ReadBlockRefs(stream, block, data->Dests);
+	ReadBlockRefs(stream, block, data->ModifiedMeshes);
+
+	data->KeepMeshes = Endian.read<bool>(stream);
+	data->Snapshot = FetchRef(stream);
+}
+
+void NifDocument::ParsePhysXPropDesc(std::string_view &stream, BlockData &block)
+{
+	NiPhysXPropDesc *data = block.AddData<NiPhysXPropDesc>();
+
+	ReadBlockRefs(stream, block, data->Actors);
+	ReadBlockRefs(stream, block, data->Joints);
+	ReadBlockRefs(stream, block, data->Clothes);
+
+	unsigned int materialCount = Endian.read<unsigned int>(stream);
+
+	for (unsigned int i = 0; i < materialCount; ++i)
+	{
+		unsigned short key = Endian.read<unsigned short>(stream);
+
+		data->Materials[key] = FetchRef(stream);
+	}
+
+	unsigned int stateCount = Endian.read<unsigned int>(stream);
+
+	data->StateNames.resize(stateCount);
+
+	for (unsigned int i = 0; i < stateCount; ++i)
+	{
+		unsigned int stringCount = Endian.read<unsigned int>(stream);
+
+		auto &state = data->StateNames[i];
+
+		state.Strings.resize(stringCount);
+
+		for (unsigned int j = 0; j < stringCount; ++j)
+		{
+			state.Strings[j].String = FetchString(stream);
+			state.Strings[j].Value = Endian.read<unsigned int>(stream);
+		}
+	}
+
+	data->Flags = Endian.read<unsigned char>(stream);
+}
+
+void NifDocument::ParsePhysXActorDesc(std::string_view &stream, BlockData &block)
+{
+	NiPhysXActorDesc *data = block.AddData<NiPhysXActorDesc>();
+
+	data->ActorName = FetchString(stream);
+
+	unsigned int poseCount = Endian.read<unsigned int>(stream);
+
+	data->Poses.resize(poseCount);
+
+	for (unsigned int i = 0; i < poseCount; ++i)
+	{
+		ParseMatrix(stream, data->Poses[i]);
+
+		data->Poses[i].SetTranslation(ParseVector3(stream));
+	}
+
+	data->BodyDesc = FetchRef(stream);
+	data->Density = Endian.read<float>(stream);
+	data->ActorFlags = (NxActorFlag)Endian.read<unsigned int>(stream);
+	data->ActorGroup = Endian.read<unsigned short>(stream);
+	data->DominanceGroup = Endian.read<unsigned short>(stream);
+	data->ContactReportFlags = Endian.read<unsigned int>(stream);
+	data->ForceFieldMaterial = Endian.read<unsigned short>(stream);
+
+	ReadBlockRefs(stream, block, data->ShapeDescriptions);
+
+	data->ActorParent = FetchRef(stream);
+	data->Source = FetchRef(stream);
+	data->Dest = FetchRef(stream);
+}
+
+void NifDocument::ParsePhysXShapeDesc(std::string_view &stream, BlockData &block)
+{
+	NiPhysXShapeDesc *data = block.AddData<NiPhysXShapeDesc>();
+
+	data->ShapeType = (NxShapeType)Endian.read<unsigned int>(stream);
+
+	ParseMatrix(stream, data->LocalPose);
+
+	data->LocalPose.SetTranslation(ParseVector3(stream));
+	data->Flags = (NxShapeFlag)Endian.read<unsigned int>(stream);
+	data->CollisionGroup = Endian.read<unsigned short>(stream);
+	data->MaterialIndex = Endian.read<unsigned short>(stream);
+	data->Density = Endian.read<float>(stream);
+	data->Mass = Endian.read<float>(stream);
+	data->SkinWidth = Endian.read<float>(stream);
+	data->ShapeName = FetchString(stream);
+	data->NonInteractingCompartment = Endian.read<unsigned int>(stream);
+	data->CollisionBits[0] = Endian.read<unsigned int>(stream);
+	data->CollisionBits[1] = Endian.read<unsigned int>(stream);
+	data->CollisionBits[2] = Endian.read<unsigned int>(stream);
+	data->CollisionBits[3] = Endian.read<unsigned int>(stream);
+	data->Mesh = FetchRef(stream);
+}
+
+void dumpHex(const unsigned char *data, size_t size, size_t rowWidth = 0x10)
+{
+	std::cout << "\n      " << std::hex;
+
+	for (size_t i = 0; i < rowWidth; ++i)
+		std::cout << ' ' << std::setw(2) << std::setfill('0') << i;
+
+	std::cout << "\n      ";
+
+	for (size_t i = 0; i < rowWidth; ++i)
+		std::cout << "---";
+
+	for (size_t row = 0; row < size; row += rowWidth)
+	{
+		std::cout << "\n"
+				  << std::setw(4) << std::setfill('0') << row << " |";
+
+		size_t i = 0;
+
+		for (i; i + row < size && i < rowWidth; ++i)
+			std::cout << ' ' << std::setw(2) << std::setfill('0') << (size_t)data[row + i];
+
+		for (i; i < rowWidth; ++i)
+			std::cout << "   ";
+
+		std::cout << " | ";
+
+		for (i = 0; i + row < size && i < rowWidth; ++i)
+		{
+			char value = (char)data[row + i];
+
+			if (value < 0x20 || value > 0x7E)
+				value = '.';
+
+			std::cout << (char)value;
+		}
+	}
+
+	std::cout << std::endl;
+}
+
+NxsMeshType parseNxsConvexMesh(const char *data, size_t size, NiPhysXMeshDesc *meshDesc)
+{
+	// dumpHex((const unsigned char*)data, size);
+
+	Endian endian(std::endian::little);
+
+	std::string_view stream(data, size);
+
+	unsigned int unk1 = endian.read<unsigned int>(stream);
+	unsigned int unk2 = endian.read<unsigned int>(stream);
+
+	if (strncmp(stream.data(), "ICE\1CLHL", 8) != 0)
+	{
+		size += 0;
+	}
+
+	advanceStream(stream, 8);
+
+	unsigned int unk3 = endian.read<unsigned int>(stream);
+
+	if (strncmp(stream.data(), "ICE\1", 4) != 0)
+	{
+		size += 0;
+	}
+
+	advanceStream(stream, 4);
+
+	unsigned int unk4 = endian.read<unsigned int>(stream);
+	unsigned int unk5 = endian.read<unsigned int>(stream);
+	unsigned int vertexCount = endian.read<unsigned int>(stream);
+	unsigned int faceCount = endian.read<unsigned int>(stream);
+	unsigned int unk6 = endian.read<unsigned int>(stream);
+	unsigned int unk7 = endian.read<unsigned int>(stream);
+	unsigned int unk8 = endian.read<unsigned int>(stream);
+	unsigned int unk9 = endian.read<unsigned int>(stream);
+
+	meshDesc->Mesh.Vertices.resize(vertexCount);
+
+	for (unsigned int i = 0; i < vertexCount; ++i)
+	{
+		meshDesc->Mesh.Vertices[i] = {
+			endian.read<float>(stream),
+			endian.read<float>(stream),
+			endian.read<float>(stream)};
+	}
+
+	unsigned int unk10 = endian.read<unsigned int>(stream);
+
+	meshDesc->Mesh.Faces.resize(faceCount);
+
+	for (unsigned int i = 0; i < faceCount; ++i)
+	{
+		NxsFace &face = meshDesc->Mesh.Faces[i];
+
+		face = {
+			endian.read<unsigned char>(stream),
+			endian.read<unsigned char>(stream),
+			endian.read<unsigned char>(stream)};
+
+		if (face.Vert1 >= vertexCount || face.Vert2 >= vertexCount || face.Vert3 >= vertexCount)
+		{
+			size += 0;
+		}
+	}
+
+	return NxsMeshType::Convex;
+}
+
+NxsMeshType parseNxsTriangleMesh(const char *data, size_t size, NiPhysXMeshDesc *meshDesc)
+{
+	Endian endian(std::endian::little);
+
+	std::string_view stream(data, size);
+
+	unsigned int unk1 = endian.read<unsigned int>(stream);
+	unsigned int unk2 = endian.read<unsigned int>(stream);
+	float unk3 = endian.read<float>(stream);
+	size_t unk4 = endian.read<size_t>(stream);
+
+	if (unk4 != 0xFF || unk1 != 1)
+	{
+		size += 0;
+	}
+
+	unsigned int vertexCount = endian.read<unsigned int>(stream);
+	unsigned int faceCount = endian.read<unsigned int>(stream);
+
+	meshDesc->Mesh.Vertices.resize(vertexCount);
+	meshDesc->Mesh.Faces.resize(faceCount);
+
+	for (unsigned int i = 0; i < vertexCount; ++i)
+	{
+		meshDesc->Mesh.Vertices[i] = {
+			endian.read<float>(stream),
+			endian.read<float>(stream),
+			endian.read<float>(stream)};
+	}
+
+	for (unsigned int i = 0; i < faceCount; ++i)
+	{
+		NxsFace &face = meshDesc->Mesh.Faces[i];
+
+		face = {
+			endian.read<unsigned char>(stream),
+			endian.read<unsigned char>(stream),
+			endian.read<unsigned char>(stream)};
+
+		if (face.Vert1 >= vertexCount || face.Vert2 >= vertexCount || face.Vert3 >= vertexCount)
+		{
+			size += 0;
+		}
+	}
+
+	unsigned int unkCount = endian.read<unsigned int>(stream);
+
+	std::vector<unsigned char> unkData(unkCount);
+
+	for (unsigned int i = 0; i < unkCount; ++i)
+	{
+		unkData[i] = endian.read<unsigned char>(stream);
+	}
+
+	return NxsMeshType::Triangle;
+}
+
+NxsMeshType parseNxsClothMesh(const char *data, size_t size, NiPhysXMeshDesc *meshDesc)
+{
+	return NxsMeshType::None;
+}
+
+NxsMeshType parseNxsMesh(const unsigned char *data, size_t size, NiPhysXMeshDesc *meshDesc)
+{
+	const size_t headerCheckSize = std::min(size, (size_t)4);
+	const size_t headerCheckTypeSize = std::min((size_t)((long long)size - 4), (size_t)4);
+
+	const char *strData = reinterpret_cast<const char *>(data);
+
+	bool headerMatches = strncmp(strData, "NXS\1", headerCheckSize) == 0;
+
+	if (!headerMatches)
+	{
+		return NxsMeshType::None;
+	}
+
+	if (strncmp(strData + 4, "CVXM", headerCheckTypeSize) == 0)
+	{
+		return parseNxsConvexMesh(strData + 8, size - 8, meshDesc);
+	}
+
+	if (strncmp(strData + 4, "MESH", headerCheckTypeSize) == 0)
+	{
+		return parseNxsTriangleMesh(strData + 8, size - 8, meshDesc);
+	}
+
+	if (strncmp(strData + 4, "CLTH", headerCheckTypeSize) == 0)
+	{
+		return parseNxsClothMesh(strData + 8, size - 8, meshDesc);
+	}
+
+	return NxsMeshType::None;
+}
+
+void NifDocument::ParsePhysXMeshDesc(std::string_view &stream, BlockData &block)
+{
+	NiPhysXMeshDesc *data = block.AddData<NiPhysXMeshDesc>();
+
+	data->MeshName = FetchString(stream);
+
+	unsigned int meshSize = Endian.read<unsigned int>(stream);
+
+	data->MeshData.resize(meshSize);
+
+	std::memcpy(data->MeshData.data(), stream.data(), meshSize);
+
+	advanceStream(stream, meshSize);
+
+	bool printMesh = false;
+
+	if (printMesh)
+	{
+		dumpHex(data->MeshData.data(), meshSize);
+	}
+
+	data->Mesh.Type = parseNxsMesh(data->MeshData.data(), meshSize, data);
+
+	data->MeshFlags = (NxMeshShapeFlags)Endian.read<unsigned int>(stream);
+	data->PagingMode = (NxPagingMode)Endian.read<unsigned int>(stream);
+	data->Flags = (PhysXMeshFlags)Endian.read<unsigned char>(stream);
+}
+
+void advanceStream(std::string_view &stream, size_t amount)
+{
+	stream = std::string_view(stream.data() + amount, stream.size() - amount);
+}
+
+void NifDocument::ParserNoOp(std::string_view &stream, BlockData &block)
+{
+	advanceStream(stream, block.BlockSize);
+}
+
+std::unordered_map<std::string, NifDocument::BlockParseFunction> parserFunctions = {
+	{"NiNode", &NifDocument::ParseNode},
+	{"NiMesh", &NifDocument::ParseMesh},
+	{"NiTexturingProperty", &NifDocument::ParseTexturingProperty},
+	{"NiSourceTexture", &NifDocument::ParseSourceTexture},
+	{"NiDataStream", &NifDocument::ParseStream},
+	{"NiMaterialProperty", &NifDocument::ParseMaterialProperty},
+	{"NiSkinningMeshModifier", &NifDocument::ParseSkinningMeshModifier},
+	{"NiSequenceData", &NifDocument::ParseSequenceData},
+	{"NiBSplineCompTransformEvaluator", &NifDocument::ParseBSplineCompTransformEvaluator},
+	{"NiBSplineData", &NifDocument::ParseBSplineData},
+	{"NiBSplineBasisData", &NifDocument::ParseBSplineBasisData},
+	{"NiTransformEvaluator", &NifDocument::ParseTransformEvaluator},
+	{"NiTransformData", &NifDocument::ParseTransformData},
+	{"NiTextKeyExtraData", &NifDocument::ParseTextKeyExtraData},
+	{"NiColorExtraData", &NifDocument::ParseColorExtraData},
+	{"NiFloatExtraData", &NifDocument::ParseFloatExtraData},
+	{"NiAlphaProperty", &NifDocument::ParseAlphaProperty},
+	{"NiVertexColorProperty", &NifDocument::ParseVertexColorProperty},
+	{"NiPhysXProp", &NifDocument::ParsePhysXProp},
+	{"NiPhysXPropDesc", &NifDocument::ParsePhysXPropDesc},
+	{"NiPhysXActorDesc", &NifDocument::ParsePhysXActorDesc},
+	{"NiPhysXShapeDesc", &NifDocument::ParsePhysXShapeDesc},
+	{"NiPhysXMeshDesc", &NifDocument::ParsePhysXMeshDesc},
+};
+
+std::set<std::string> ignoreBlockName = {
+	"NiFloatInterpolator",
+	"NiFloatData",
+	"NiDataStream",
+	"NiTextureTransformController",
+	"NiTransformController",
+	"NiTransformInterpolator",
+	"NiSkinningMeshModifier",
+	"NiBSplineCompTransformEvaluator",
+	"NiBSplineData",
+	"NiBSplineBasisData",
+	"NiTransformEvaluator",
+	"NiTransformData",
+	"NiPhysXPropDesc",
+	"NiPhysXActorDesc",
+	"NiPhysXShapeDesc",
+	"NiPhysXMeshDesc"};
+
+std::unordered_map<std::string, std::string> attributeAliases = {
+	{"POSITION", "position"},
+	{"POSITION_BP", "position"},
+	{"NORMAL", "normal"},
+	{"NORMAL_BP", "normal"},
+	{"TEXCOORD", "texcoord"},
+	{"BINORMAL", "binormal"},
+	{"BINORMAL_BP", "binormal"},
+	{"TANGENT", "tangent"},
+	{"TANGENT_BP", "tangent"},
+	{"MORPH_POSITION", "morphpos"},
+	{"MORPH_POSITION1", "morphpos1"},
+	{"MORPH_POSITION_BP", "morphpos"},
+	{"MORPH_POSITION_BP1", "morphpos1"},
+	{"BLENDINDICES", "blendindices"},
+	{"BLENDWEIGHT", "blendweight"},
+	{"COLOR", "color"}};
+
+using namespace Engine::Graphics;
+
+std::ostream &operator<<(std::ostream &out, const BlockData *block)
+{
+	return out << "[" << block->BlockIndex << "] " << block->BlockType << " \"" << block->BlockName << "\"";
+}
+
+std::ostream &operator<<(std::ostream &out, const NiDataBlock *blockData)
+{
+	const BlockData *block = &blockData->Document->Blocks[blockData->BlockIndex];
+	return out << "[" << block->BlockIndex << "] " << block->BlockType << " \"" << block->BlockName << "\"";
+}
+
+struct VersionHeader
+{
+	unsigned short Numbers[4] = {0};
+};
+
+void NifParser::Parse(std::string_view stream)
+{
+	if (!Package)
+		Package = new ModelPackage();
+
+	std::string_view streamStart = stream;
+
+	NifDocument document;
+
+	std::string headerString;
+
+	size_t index = 0;
+
+	for (index; stream[index] != 0x0A; ++index)
+		;
+
+	headerString.append(stream.data(), index);
+
+	size_t versionStart;
+
+	for (versionStart = headerString.size(); versionStart > 0 && (headerString[versionStart - 1] == '.' || (headerString[versionStart - 1] >= '0' && headerString[versionStart - 1] <= '9')); --versionStart)
+		;
+
+	VersionHeader version;
+
+	for (size_t i = 0; i < 4; ++i)
+	{
+		version.Numbers[i] = std::atoi(headerString.data() + versionStart);
+
+		for (versionStart; headerString[versionStart] && headerString[versionStart] != '.'; ++versionStart)
+			;
+
+		++versionStart;
+	}
+
+	if (version.Numbers[0] < 30)
+	{
+		std::cout << Name << " version number too low: " << headerString << std::endl;
+
+		return;
+	}
+
+	advanceStream(stream, index + 1);
+	advanceStream(stream, 4);
+
+	Endian endian = Endian(stream[0] ? std::endian::little : std::endian::big);
+	document.Endian = endian;
+
+	advanceStream(stream, 1);
+
+	unsigned int userVersion = endian.read<unsigned int>(stream);
+	unsigned int numBlocks = endian.read<unsigned int>(stream);
+	unsigned int metaBlockSize = endian.read<unsigned int>(stream);
+
+	advanceStream(stream, metaBlockSize);
+
+	unsigned short numBlockTypes = endian.read<unsigned short>(stream);
+
+	if (numBlockTypes == 0)
+		return;
+
+	document.BlockTypes.resize(numBlockTypes);
+	document.BlockTypeIndices.resize(numBlocks);
+	document.BlockSizes.resize(numBlocks);
+
+	for (unsigned short i = 0; i < numBlockTypes; ++i)
+	{
+		unsigned int blockTypeSize = endian.read<unsigned int>(stream);
+
+		if (blockTypeSize > 0)
+		{
+			document.BlockTypes[i].append(stream.data(), blockTypeSize);
+			advanceStream(stream, blockTypeSize);
+		}
+	}
+
+	for (unsigned int i = 0; i < numBlocks; ++i)
+		document.BlockTypeIndices[i] = 0x7FFF & endian.read<unsigned short>(stream);
+
+	for (unsigned int i = 0; i < numBlocks; ++i)
+		document.BlockSizes[i] = endian.read<unsigned int>(stream);
+
+	unsigned int numStrings = endian.read<unsigned int>(stream);
+	unsigned int maxStringLength = endian.read<unsigned int>(stream);
+
+	document.Strings.resize(numStrings);
+
+	for (unsigned int i = 0; i < numStrings; ++i)
+	{
+		unsigned int stringLength = endian.read<unsigned int>(stream);
+
+		if (stringLength > 0)
+		{
+			document.Strings[i].append(stream.data(), stringLength);
+			advanceStream(stream, stringLength);
+		}
+	}
+
+	unsigned int numGroups = endian.read<unsigned int>(stream);
+
+	if (numGroups > 0)
+		throw "WARNING, UNIMPLEMENTED";
+
+	document.Blocks.resize(numBlocks);
+
+	for (unsigned int blockIndex = 0; blockIndex < numBlocks; ++blockIndex)
+	{
+		BlockData &block = document.InitializeBlock(blockIndex);
+
+		unsigned int position = (unsigned int)(stream.data() - streamStart.data()); // stream.tellg();
+
+		size_t truncateIndex = 0;
+
+		for (truncateIndex; truncateIndex < block.BlockType.size() && block.BlockType[truncateIndex] > 1; ++truncateIndex)
+			;
+
+		std::string typeName = block.BlockType.substr(0, truncateIndex);
+
+		if (block.BlockSize > 0)
+		{
+			auto parserIterator = parserFunctions.find(typeName);
+
+			if (parserIterator == parserFunctions.end())
+				document.ParserNoOp(stream, block);
+			else
+			{
+				auto iterator = ignoreBlockName.find(typeName);
+
+				if (iterator == ignoreBlockName.end())
+				{
+					unsigned int name = endian.read<unsigned int>(stream);
+
+					if (name != 0xFFFFFFFFu)
+						block.BlockName = document.Strings[name];
+
+					block.BlockStart = 4;
+				}
+
+				(document.*(parserIterator->second))(stream, block);
+			}
+		}
+
+		unsigned int newPosition = (unsigned int)(stream.data() - streamStart.data());
+		unsigned int parsedInBlock = newPosition - position;
+
+		if (parsedInBlock != block.BlockSize)
+		{
+			advanceStream(stream, block.BlockSize - parsedInBlock);
+
+			auto parserIterator = parserFunctions.find(typeName);
+
+			if (parserIterator == parserFunctions.end())
+				document.ParserNoOp(stream, block);
+			else
+				(document.*(parserIterator->second))(stream, block);
+
+			throw "block parser read wrong amount";
+		}
+	}
+
+	std::unordered_map<unsigned int, BlockData *> parents;
+	std::unordered_map<unsigned int, size_t> parentEntries;
+	std::unordered_map<unsigned int, size_t> parentLinkTypes;
+	std::unordered_map<unsigned int, size_t> materials;
+	std::unordered_map<unsigned int, size_t> nodeIndices;
+	std::unordered_map<size_t, size_t> boneIndices;
+
+	std::vector<Engine::Graphics::VertexAttributeFormat> physXMeshAttributes = {
+		{.Type = VertexAttributeFormat::AttributeDataType::Float32,
+		 .ElementCount = 3,
+		 .Name = "position"},
+		{.Type = VertexAttributeFormat::AttributeDataType::Float32,
+		 .ElementCount = 3,
+		 .Name = "normal",
+		 .Binding = 1}};
+	std::shared_ptr<Engine::Graphics::MeshFormat> physXMeshFormat = Engine::Graphics::MeshFormat::GetFormat(physXMeshAttributes);
+	size_t physXMaterialIndex = (size_t)-1;
+
+	for (unsigned int blockIndex = 0; blockIndex < numBlocks; ++blockIndex)
+	{
+		BlockData &block = document.Blocks[blockIndex];
+
+		size_t parentIndex = (size_t)-1;
+		auto parentEntryIndex = parentEntries.find(blockIndex);
+
+		if (parentEntryIndex != parentEntries.end())
+			parentIndex = parentEntryIndex->second;
+
+		if (block.BlockType == "NiNode")
+		{
+			NiNode *data = block.Data->Cast<NiNode>();
+
+			nodeIndices[data->BlockIndex] = Package->Nodes.size();
+
+			for (size_t i = 0; i < data->Children.size(); ++i)
+			{
+				if (data->Children[i] == nullptr)
+					continue;
+
+				unsigned int childBlock = data->Children[i]->BlockIndex;
+
+				parents[childBlock] = &block;
+				parentEntries[childBlock] = Package->Nodes.size();
+			}
+
+			NiTransform &nodeTransform = data->Transformation;
+
+			std::shared_ptr<Engine::Transform> transform = Engine::Create<Engine::Transform>();
+			// COMMENTED OUT FOR TESTING: transform->SetTransformation(Matrix4F(nodeTransform.Translation) * nodeTransform.Rotation * Matrix4F::NewScale(nodeTransform.Scale, nodeTransform.Scale, nodeTransform.Scale));
+			// For testing: force block to show at origin
+			Vector3SF forcedPosition(0.0f, 0.0f, 0.0f);
+			transform->SetTransformation(Matrix4F(forcedPosition) * nodeTransform.Rotation * Matrix4F::NewScale(nodeTransform.Scale, nodeTransform.Scale, nodeTransform.Scale));
+			// Testing block ^
+			transform->SetInheritsTransformation((data->Flags & 0x4 || true) != 0); // || true);
+			transform->Name = block.BlockName;
+
+			Package->Nodes.push_back(ModelPackageNode{block.BlockName, parentIndex, (size_t)-1, blockIndex, false, false, false, false, nullptr, nullptr, transform});
+		}
+		else if (block.BlockType == "NiMesh")
+		{
+			NiMesh *data = block.Data->Cast<NiMesh>();
+
+			nodeIndices[data->BlockIndex] = Package->Nodes.size();
+
+			size_t materialIndex = (size_t)-1;
+
+			if (data->Materials.size() > 1)
+				materialIndex += 0;
+
+			// if (data->Materials.size() > 0)
+			{
+				size_t currentMaterial = 0;
+
+				for (size_t i = 0; i < data->Properties.size(); ++i)
+				{
+					if (data->Properties[i]->BlockType == "NiMaterialProperty")
+					{
+						const BlockData *materialBlock = data->Properties[i];
+						NiMaterialProperty *materialData = materialBlock->Data->Cast<NiMaterialProperty>();
+
+						if (materials.contains(materialBlock->BlockIndex))
+						{
+							materialIndex = materials[materialBlock->BlockIndex];
+
+							break;
+						}
+
+						materialIndex = Package->Materials.size();
+
+						materials[materialBlock->BlockIndex] = materialIndex;
+						Package->Materials.push_back(ModelPackageMaterial{});
+
+						ModelPackageMaterial &material = Package->Materials.back();
+
+						material.Name = materialBlock->BlockName;
+						material.ShaderName = data->Materials.size() > 0 ? data->Materials[0] : "";
+						material.DiffuseColor = materialData->DiffuseColor;
+						material.SpecularColor = materialData->SpecularColor;
+						material.AmbientColor = materialData->AmbientColor;
+						material.EmissiveColor = materialData->EmissiveColor;
+						material.Shininess = materialData->Glossiness;
+						material.Alpha = materialData->Alpha;
+
+						for (size_t j = 0; j < data->Properties.size(); ++j)
+						{
+							const BlockData *propertyBlock = data->Properties[j];
+
+							if (propertyBlock->BlockType == "NiTexturingProperty")
+							{
+								NiTexturingProperty *propertyData = propertyBlock->Data->Cast<NiTexturingProperty>();
+
+								bool breakP = false;
+
+								const auto fetchPath = [this, &breakP](const NiTexturingProperty::TextureData &texture) -> const std::string &
+								{
+									static const std::string empty("");
+
+									if (texture.Source == nullptr)
+										return empty;
+
+									const NiSourceTexture *textureData = texture.Source->GetData<NiSourceTexture>();
+
+									if (breakP)
+										breakP |= true;
+
+									return textureData->FileName;
+								};
+
+								const auto fetchTransform = [this](const NiTexturingProperty::TextureData &texture) -> ModelPackageTextureTransform
+								{
+									if (!texture.HasThisTexture || !texture.HasTextureTransform)
+										return ModelPackageTextureTransform{};
+
+									return ModelPackageTextureTransform{
+										texture.HasTextureTransform,
+										texture.Translation,
+										texture.Scale,
+										texture.Center,
+										texture.Rotation,
+										(int)texture.TransformMethod};
+								};
+
+								material.TextureApplyMode = (propertyData->Flags >> 1) & 0x3;
+
+								material.Diffuse = fetchPath(propertyData->BaseTexture);
+								material.DiffuseTransform = fetchTransform(propertyData->BaseTexture);
+								material.Normal = fetchPath(propertyData->NormalTexture);
+								material.NormalTransform = fetchTransform(propertyData->NormalTexture);
+								material.Specular = fetchPath(propertyData->GlossTexture);
+								material.SpecularTransform = fetchTransform(propertyData->GlossTexture);
+								material.Glow = fetchPath(propertyData->GlowTexture);
+								material.GlowTransform = fetchTransform(propertyData->GlowTexture);
+								material.Decal = fetchPath(propertyData->Decal0Texture);
+								material.DecalTransform = fetchTransform(propertyData->Decal0Texture);
+
+								if (propertyData->ShaderTextures.size() > 0)
+								{
+									if (propertyData->ShaderTextures.size() > 1)
+									{
+										if (material.ShaderName == "MS2CharacterHairMaterial")
+										{
+											material.Anisotropic = fetchPath(propertyData->ShaderTextures[1].Map);
+											material.AnisotropicTransform = fetchTransform(propertyData->ShaderTextures[1].Map);
+										}
+									}
+
+									material.OverrideColor = fetchPath(propertyData->ShaderTextures[0].Map);
+									material.OverrideColorTransform = fetchTransform(propertyData->ShaderTextures[0].Map);
+								}
+
+								breakP = true;
+
+								// fetchPath(data->DarkTexture);
+								// fetchPath(data->DetailTexture);
+								fetchPath(propertyData->BumpTexture);
+								fetchPath(propertyData->ParallaxTexture);
+								// fetchPath(data->Decal0Texture);
+							}
+							else if (propertyBlock->BlockType == "NiAlphaProperty")
+							{
+								NiAlphaProperty *propertyData = propertyBlock->Data->Cast<NiAlphaProperty>();
+
+								material.SourceBlendMode = (propertyData->Flags >> 1) & 0xF;
+								material.DestBlendMode = (propertyData->Flags >> 5) & 0xF;
+								material.AlphaTestMode = (propertyData->Flags >> 9) & 0xF;
+								material.TestThreshold = propertyData->Threshold;
+							}
+							else if (propertyBlock->BlockType == "NiVertexColorProperty")
+							{
+								NiVertexColorProperty *propertyData = propertyBlock->Data->Cast<NiVertexColorProperty>();
+
+								material.LightingMode = (propertyData->Flags >> 3) & 0x1;
+								material.SourceVertexMode = (propertyData->Flags >> 4) & 0x3;
+							}
+						}
+
+						for (size_t j = 0; j < data->ExtraData.size(); ++j)
+						{
+							const BlockData *propertyBlock = data->ExtraData[j];
+
+							if (propertyBlock->BlockType == "NiColorExtraData")
+							{
+								NiColorExtraData *propertyData = propertyBlock->Data->Cast<NiColorExtraData>();
+
+								if (propertyBlock->BlockName.size() != 14 && strncmp(propertyBlock->BlockName.c_str(), "OverrideColor", 13))
+									continue;
+
+								char overrideSlot = propertyBlock->BlockName[13];
+
+								if (overrideSlot < '0' || overrideSlot > '2')
+									continue;
+
+								overrideSlot -= '0';
+
+								switch (overrideSlot)
+								{
+								case 0:
+									material.OverrideColor0 = propertyData->Value;
+									break;
+								case 1:
+									material.OverrideColor1 = propertyData->Value;
+									break;
+								case 2:
+									material.OverrideColor2 = propertyData->Value;
+									break;
+								default:
+									break;
+								}
+							}
+							else if (propertyBlock->BlockType == "NiFloatExtraData")
+							{
+								NiFloatExtraData *propertyData = propertyBlock->Data->Cast<NiFloatExtraData>();
+
+								if (propertyBlock->BlockName == "FresnelBoost")
+									material.FresnelBoost = propertyData->Value;
+								else if (propertyBlock->BlockName == "FresnelExponent")
+									material.FresnelExponent = propertyData->Value;
+								else if (propertyBlock->BlockName == "ColorBoost")
+									material.ColorBoost = propertyData->Value;
+							}
+						}
+
+						++currentMaterial;
+					}
+				}
+
+				if (currentMaterial > 1)
+					currentMaterial += 0;
+
+				if (materialIndex != (size_t)-1)
+					for (size_t i = 0; i < data->Properties.size(); ++i)
+						parentEntries[data->Properties[i]->BlockIndex] = materialIndex;
+
+				for (size_t i = 0; i < data->ExtraData.size(); ++i)
+				{
+					parentEntries[data->ExtraData[i]->BlockIndex] = materialIndex;
+				}
+			}
+
+			size_t indexBufferBinding = 0;
+			std::vector<int> indexBuffer;
+
+			for (size_t i = 0; i < data->Streams.size(); ++i)
+			{
+				NiDataStream *stream = data->Streams[i].Stream->Data->Cast<NiDataStream>();
+
+				if (stream->Usage == StreamUsage::IndexBuffer)
+				{
+					NiDataStream *stream = data->Streams[i].Stream->Data->Cast<NiDataStream>();
+
+					indexBufferBinding = i;
+
+					size_t indexCount = stream->Regions[0].NumIndices;
+
+					indexBuffer.resize(indexCount);
+
+					const char *buffer = reinterpret_cast<const char *>(stream->StreamData.data());
+
+					for (size_t j = 0; j < indexCount; ++j)
+						stream->Attributes[0].Copy(buffer + j * stream->Attributes[0].GetSize(), indexBuffer.data() + j, Enum::AttributeDataType::Int32);
+
+					break;
+				}
+			}
+
+			std::vector<Engine::Graphics::VertexAttributeFormat> attributes;
+			std::vector<void *> dataBuffers;
+
+			size_t binding = 0;
+			size_t vertexCount = 0;
+
+			for (size_t i = 0; i < data->Streams.size(); ++i)
+			{
+				if (data->Streams[i].Stream->Data == nullptr)
+					continue;
+
+				NiDataStream *stream = data->Streams[i].Stream->Data->Cast<NiDataStream>();
+
+				if (stream->Usage != StreamUsage::VertexBuffer)
+					continue;
+
+				size_t semanticsCount = data->Streams[i].ComponentSemantics.size();
+				size_t attributeCount = stream->Attributes.size();
+
+				vertexCount = stream->Regions[0].NumIndices;
+
+				if (semanticsCount != attributeCount)
+					throw "mismatching semantics and attributes";
+
+				dataBuffers.push_back(stream->StreamData.data());
+
+				for (size_t j = 0; j < semanticsCount; ++j)
+				{
+					const std::string semantic = data->Streams[i].ComponentSemantics[j].Name;
+
+					auto index = attributeAliases.find(semantic);
+
+					if (!SemanticsFound.contains(semantic))
+						SemanticsFound.insert(semantic);
+
+					if (index == attributeAliases.end())
+						stream->Attributes[j].Name = semantic;
+					else
+						stream->Attributes[j].Name = index->second;
+
+					if (data->Streams[i].ComponentSemantics[j].Index != 0)
+					{
+						std::stringstream name;
+						name << stream->Attributes[j].Name << data->Streams[i].ComponentSemantics[j].Index;
+						stream->Attributes[j].Name = name.str();
+					}
+
+					stream->Attributes[j].Binding = binding;
+
+					attributes.push_back(stream->Attributes[j]);
+				}
+
+				++binding;
+			}
+
+			bool isVisible = (data->Flags & 0x1) == 0;
+
+			NiTransform &nodeTransform = data->Transformation;
+
+			std::shared_ptr<Engine::Transform> transform = Engine::Create<Engine::Transform>();
+			transform->SetInheritsTransformation(((data->Flags & 0x4) || true) != 0); // || true);
+			transform->Name = block.BlockName;
+
+			std::shared_ptr<Engine::Graphics::MeshFormat> format = Engine::Graphics::MeshFormat::GetFormat(attributes);
+			std::shared_ptr<Engine::Graphics::MeshData> mesh = Engine::Create<Engine::Graphics::MeshData>();
+
+			mesh->SetFormat(format);
+			mesh->PushVertices(vertexCount, false);
+			mesh->PushIndices(indexBuffer);
+
+			format->Copy(dataBuffers.data(), mesh->GetData(), format, vertexCount);
+
+			Matrix4F transformation = Matrix4F(nodeTransform.Translation) * nodeTransform.Rotation * Matrix4F::NewScale(nodeTransform.Scale, nodeTransform.Scale, nodeTransform.Scale);
+
+			transform->SetTransformation(transformation);
+			glm::mat4 glmTransform = glm::mat4(1.0f);
+			for (int i = 0; i < 4; ++i)
+				for (int j = 0; j < 4; ++j)
+					glmTransform[j][i] = transformation.Data[i][j]; // row-to-column-major
+
+			Package->Nodes.back().LocalTransformGLM = glmTransform;
+
+			Package->Nodes.push_back(ModelPackageNode{block.BlockName, parentIndex, materialIndex, blockIndex, false, false, false, isVisible, format, mesh, transform});
+		}
+		else if (block.BlockType == "NiPhysXProp")
+		{
+			Package->PhysXProps.push_back({});
+
+			ModelPhysXProp &prop = Package->PhysXProps.back();
+
+			NiPhysXProp *data = block.Data->Cast<NiPhysXProp>();
+
+			if (data->Snapshot != nullptr)
+			{
+				for (const auto &actorData : data->Snapshot->Actors)
+				{
+					prop.Actors.push_back({});
+
+					ModelPhysXActor &actor = prop.Actors.back();
+
+					bool physicsDisabled = (actorData->ActorFlags & (NxActorFlag::DisableCollision | NxActorFlag::DisableResponse)) != 0;
+
+					for (const auto &shapeData : actorData->ShapeDescriptions)
+					{
+						if (shapeData->Mesh != nullptr)
+						{
+							actor.Meshes.push_back({});
+
+							ModelPhysXMesh &mesh = actor.Meshes.back();
+							const NxsMesh &colliderMesh = shapeData->Mesh->Mesh;
+
+							Package->HasEnabledPhysXMeshes = !physicsDisabled;
+
+							if (colliderMesh.Type == NxsMeshType::None)
+							{
+								continue;
+							}
+
+							std::shared_ptr<Engine::Graphics::MeshData> meshData = Engine::Create<Engine::Graphics::MeshData>();
+
+							size_t faceCount = colliderMesh.Faces.size();
+							size_t vertexCount = faceCount * 3;
+							std::vector<int> indexBuffer(faceCount * 3);
+							std::vector<Vector3SF> vertexBuffer(vertexCount);
+							std::vector<Vector3SF> normalBuffer(vertexCount);
+
+							for (size_t i = 0; i < colliderMesh.Faces.size(); ++i)
+							{
+								const NxsFace &face = colliderMesh.Faces[i];
+
+								size_t i0 = 3 * i + 0;
+								size_t i1 = 3 * i + 1;
+								size_t i2 = 3 * i + 2;
+
+								indexBuffer[i0] = (int)i0;
+								indexBuffer[i1] = (int)i1;
+								indexBuffer[i2] = (int)i2;
+
+								vertexBuffer[i0] = colliderMesh.Vertices[face.Vert1];
+								vertexBuffer[i1] = colliderMesh.Vertices[face.Vert2];
+								vertexBuffer[i2] = colliderMesh.Vertices[face.Vert3];
+
+								Vector3SF normal = (vertexBuffer[i1] - vertexBuffer[i0]).Cross((vertexBuffer[i2] - vertexBuffer[i0])).Unit();
+
+								normalBuffer[i0] = normal;
+								normalBuffer[i1] = normal;
+								normalBuffer[i2] = normal;
+							}
+
+							meshData->SetFormat(physXMeshFormat);
+							meshData->PushVertices(vertexCount, false);
+							meshData->PushIndices(indexBuffer);
+
+							const void *vertexBufferPointers[2] = {
+								vertexBuffer.data(),
+								normalBuffer.data()};
+
+							physXMeshFormat->Copy(vertexBufferPointers, meshData->GetData(), physXMeshFormat, vertexCount);
+
+							std::shared_ptr<Engine::Transform> transform = Engine::Create<Engine::Transform>();
+							transform->Name = block.BlockName + "Transform";
+
+							Matrix4F transformation = Matrix4F::NewScale(data->PhysXToWorldScale, data->PhysXToWorldScale, data->PhysXToWorldScale) * actorData->Poses[0] * shapeData->LocalPose;
+
+							transform->SetTransformation(transformation);
+
+							if (physXMaterialIndex == (size_t)-1)
+							{
+								physXMaterialIndex = Package->Materials.size();
+
+								Package->Materials.push_back({});
+
+								ModelPackageMaterial &material = Package->Materials.back();
+
+								material.EmissiveColor = Color3(0.f, 0.f, 0.f);
+								material.AmbientColor = Color3(0.2f, 0.2f, 0.2f);
+
+								switch (colliderMesh.Type)
+								{
+								case NxsMeshType::Convex:
+									material.Name = "PhysX Convex Mesh";
+									break;
+								case NxsMeshType::Triangle:
+									material.Name = "PhysX Triangle Mesh";
+									break;
+								case NxsMeshType::Cloth:
+									material.Name = "PhysX Cloth Mesh";
+									break;
+								}
+							}
+
+							mesh.DataIndex = blockIndex;
+							mesh.MaterialIndex = physXMaterialIndex;
+							mesh.Format = physXMeshFormat;
+							mesh.Mesh = meshData;
+							mesh.Transform;
+
+							Package->Nodes.push_back(ModelPackageNode{"ModelPhysXMesh", 0, physXMaterialIndex, blockIndex, true, false, false, false, physXMeshFormat, meshData, transform});
+						}
+					}
+				}
+			}
+		}
+		else if (block.BlockType == "NiSequenceData")
+		{
+			Package->Animations.push_back({});
+
+			ModelPackageAnimation &animation = Package->Animations.back();
+			NiSequenceData *data = block.Data->Cast<NiSequenceData>();
+
+			animation.Name = block.BlockName;
+			animation.RootName = data->AccumRootName;
+			animation.Duration = data->Duration;
+			animation.CycleType = (AnimationCycleType)(int)data->CycleType;
+			animation.PlaybackSpeed = data->Frequency;
+
+			if (data->TextKeys != nullptr)
+			{
+				NiTextKeyExtraData *textKeyData = data->TextKeys->Data->Cast<NiTextKeyExtraData>();
+
+				animation.Events.resize(textKeyData->TextKeys.size());
+
+				for (size_t i = 0; i < textKeyData->TextKeys.size(); ++i)
+				{
+					animation.Events[i] = {textKeyData->TextKeys[i].Time, textKeyData->TextKeys[i].Value};
+				}
+			}
+
+			for (size_t i = 0; i < data->Evaluators.size(); ++i)
+			{
+				const BlockData *evaluator = data->Evaluators[i];
+
+				if (evaluator->Data == nullptr)
+				{
+					continue;
+				}
+
+				NiEvaluator *evaluatorData = evaluator->Data->Cast<NiEvaluator>();
+
+				if (animation.NodeMap.find(evaluatorData->NodeName) != animation.NodeMap.end())
+				{
+					std::cout << Name << ": " << "repeated animated node reference found " << evaluator << "" << std::endl;
+				}
+
+				animation.NodeMap[evaluatorData->NodeName] = nullptr;
+
+				bool channelTypesRecognized = evaluatorData->PositionChannel == ChannelType::Vector3 || evaluatorData->PositionChannel == ChannelType::Invalid;
+				channelTypesRecognized |= evaluatorData->RotationChannel == ChannelType::Quaternion || evaluatorData->RotationChannel == ChannelType::Invalid;
+				channelTypesRecognized |= evaluatorData->ScaleChannel == ChannelType::Float || evaluatorData->ScaleChannel == ChannelType::Invalid;
+
+				if (!channelTypesRecognized)
+				{
+					const char *const typeNames[] = {"Invalid", "Color", "Bool", "Float", "Vector3", "Rotation"};
+
+					std::cout << Name << ": " << "unsupported channel type in " << evaluator << std::endl;
+					std::cout << Name << ": " << "\t" << "Position: " << typeNames[evaluatorData->PositionChannel] << "\n";
+					std::cout << Name << ": " << "\t" << "Rotation: " << typeNames[evaluatorData->RotationChannel] << "\n";
+					std::cout << Name << ": " << "\t" << "Scale: " << typeNames[evaluatorData->ScaleChannel] << std::endl;
+				}
+
+				if (evaluator->BlockType == "NiTransformEvaluator")
+				{
+					NiTransformEvaluator *transformEvaluatorData = evaluator->Data->Cast<NiTransformEvaluator>();
+
+					if (transformEvaluatorData->Data == nullptr)
+						continue;
+
+					if (transformEvaluatorData->Data->BlockType == "NiTransformData")
+					{
+						NiTransformData *transformData = transformEvaluatorData->Data->Data->Cast<NiTransformData>();
+
+						animation.Nodes.push_back({});
+						ModelPackageAnimationNode &node = animation.Nodes.back();
+
+						node.NodeName = transformEvaluatorData->NodeName;
+
+						static const auto loadKeyframes = [](auto &keyframeData, const auto &data, NiTransformData *transformData, const std::string &Name)
+						{
+							typedef std::remove_cvref_t<decltype(data)> AnyKeyType;
+
+							keyframeData.Type = data.KeyCount > 0 ? (AnimationInterpolationType)(int)data.Interpolation : AnimationInterpolationType::None;
+
+							if (data.KeyCount == 0)
+								return;
+							if (keyframeData.Type == AnimationInterpolationType::XyzRotation)
+								return;
+
+							keyframeData.Keyframes.resize(data.KeyCount);
+
+							for (size_t i = 0; i < data.KeyCount; ++i)
+							{
+								auto &keyframe = keyframeData.Keyframes[i];
+
+								typedef std::remove_cvref_t<decltype(keyframe)> KeyframeType;
+								const bool hasParams = KeyframeType::HasQuadraticParams;
+
+								RotationType interpolation = data.Interpolation;
+
+								if constexpr (std::is_same_v<Quaternion, typename AnyKeyType::KeyType>)
+								{
+									if (interpolation == RotationType::QuadraticKey)
+										interpolation = RotationType::LinearKey;
+								}
+
+								switch (interpolation)
+								{
+								case RotationType::LinearKey:
+									keyframe.Value = data.LinearKeys[i].Value;
+									keyframe.Time = data.LinearKeys[i].Time;
+									break;
+								case RotationType::QuadraticKey:
+									keyframe.Value = data.QuadraticKeys[i].Value;
+									keyframe.Time = data.QuadraticKeys[i].Time;
+
+									if constexpr (hasParams)
+									{
+										if constexpr (std::is_same_v<Vector3SF, typename AnyKeyType::KeyType>)
+										{
+											keyframe.Params = data.QuadraticKeys[i].Forward;
+											keyframe.Backward = data.QuadraticKeys[i].Backward;
+										}
+										else
+											keyframe.Params = Vector3SF(data.QuadraticKeys[i].Forward, data.QuadraticKeys[i].Backward, 0);
+									}
+
+									break;
+								case RotationType::TbcKey:
+									keyframe.Value = data.TbcKeys[i].Value;
+									keyframe.Time = data.TbcKeys[i].Time;
+
+									keyframe.Params = Vector3SF(data.TbcKeys[i].Tension, data.TbcKeys[i].Bias, data.TbcKeys[i].Continuity);
+
+									break;
+								default:
+									std::cout << Name << ": " << "unsupported interpolation type: " << data.Interpolation << " in " << transformData << " [" << i << "]" << std::endl;
+								}
+							}
+						};
+
+						if (node.Rotation.Type != AnimationInterpolationType::XyzRotation)
+						{
+							loadKeyframes(node.Rotation, transformData->RotationKeys, transformData, Name);
+						}
+
+						if (node.Rotation.Type == AnimationInterpolationType::XyzRotation)
+						{
+							if (transformData->RotationKeys.XyzKeys.size() != 1)
+							{
+								std::cout << Name << ": " << "unsupported NiTransformData xyz rotation key count: " << transformData->RotationKeys.XyzKeys.size() << " in " << transformData << std::endl;
+							}
+
+							auto loadAxisKeys = [](ModelPackageAnimationEulerAxisNode &axis, const AnyKeysNoRotate<float> &data, NiTransformData *transformData, const std::string &Name)
+							{
+								loadKeyframes(axis, data, transformData, Name);
+							};
+
+							loadAxisKeys(node.EulerRotation.X, transformData->RotationKeys.XyzKeys[0].KeysX, transformData, Name);
+							loadAxisKeys(node.EulerRotation.Y, transformData->RotationKeys.XyzKeys[0].KeysY, transformData, Name);
+							loadAxisKeys(node.EulerRotation.Z, transformData->RotationKeys.XyzKeys[0].KeysZ, transformData, Name);
+						}
+
+						loadKeyframes(node.Translation, transformData->TranslationKeys, transformData, Name);
+						loadKeyframes(node.Scale, transformData->ScaleKeys, transformData, Name);
+					}
+					else
+					{
+						std::cout << Name << ": " << "unsupported NiTransformEvaluator data type '" << transformEvaluatorData->Data << "'" << std::endl;
+					}
+				}
+				else if (evaluator->BlockType == "NiBSplineCompTransformEvaluator")
+				{
+					NiBSplineCompTransformEvaluator *transformData = evaluator->Data->Cast<NiBSplineCompTransformEvaluator>();
+
+					if (transformData->Data == nullptr)
+						continue;
+					if (transformData->BasisData == nullptr)
+						continue;
+
+					NiBSplineData *splineData = transformData->Data->Data->Cast<NiBSplineData>();
+					NiBSplineBasisData *splineBasisData = transformData->BasisData->Data->Cast<NiBSplineBasisData>();
+
+					animation.Nodes.push_back({});
+					ModelPackageAnimationNode &node = animation.Nodes.back();
+
+					node.NodeName = transformData->NodeName;
+					node.IsSpline = true;
+
+					const auto loadSpline = [](auto &spline, NiBSplineCompTransformEvaluator *transformData, unsigned short handle, float offset, float halfRange, NiBSplineData *splineData, NiBSplineBasisData *splineBasisData)
+					{
+						if (handle == 0xFFFF)
+							return;
+
+						typedef std::remove_cvref_t<decltype(spline)> SplineType;
+						typedef SplineType::PointType PointType;
+
+						spline.Start = transformData->StartTime;
+						spline.End = transformData->EndTime;
+						spline.ControlPoints.resize(splineBasisData->NumControlPoints);
+
+						if (splineData->FloatControlPoints.size() > 0)
+						{
+							if constexpr (std::is_same_v<Quaternion, PointType>)
+							{
+								for (unsigned int i = 0; i < splineBasisData->NumControlPoints; ++i)
+								{
+									float *data = splineData->FloatControlPoints.data() + (4 * i);
+									spline.ControlPoints[i] = Quaternion(data[0], data[1], data[2], data[3]);
+								}
+							}
+							else
+							{
+								PointType *data = reinterpret_cast<PointType *>(splineData->FloatControlPoints.data() + handle);
+
+								for (unsigned int i = 0; i < splineBasisData->NumControlPoints; ++i)
+								{
+									spline.ControlPoints[i] = data[i];
+								}
+							}
+						}
+						else
+						{
+							float pointData[SplineType::Dimension] = {};
+							PointType *data = reinterpret_cast<PointType *>(pointData);
+							unsigned int index = handle;
+
+							for (unsigned int i = 0; i < splineBasisData->NumControlPoints; ++i)
+							{
+								for (size_t j = 0; j < SplineType::Dimension; ++j, ++index)
+								{
+									pointData[j] = ((float)splineData->CompactControlPoints[index] / (float)0x7FFF) * halfRange + offset;
+								}
+
+								if constexpr (std::is_same_v<Quaternion, PointType>)
+								{
+									spline.ControlPoints[i] = Quaternion(pointData[0], pointData[1], pointData[2], pointData[3]);
+								}
+								else
+								{
+									spline.ControlPoints[i] = *data;
+								}
+							}
+						}
+					};
+
+					loadSpline(node.TranslationSpline, transformData, transformData->TranslationHandle, transformData->TranslationOffset, transformData->TranslationHalfRange, splineData, splineBasisData);
+					loadSpline(node.RotationSpline, transformData, transformData->RotationHandle, transformData->RotationOffset, transformData->RotationHalfRange, splineData, splineBasisData);
+					loadSpline(node.ScaleSpline, transformData, transformData->ScaleHandle, transformData->ScaleOffset, transformData->ScaleHalfRange, splineData, splineBasisData);
+
+					if (transformData->Data->BlockType != "NiBSplineData")
+					{
+						std::cout << Name << ": " << "unsupported spline data data type '" << transformData->Data << "'" << std::endl;
+					}
+				}
+				else
+				{
+					std::cout << Name << ": " << "unsupported animation evaluator type '" << evaluator << "'" << std::endl;
+				}
+			}
+		}
+	}
+
+	for (unsigned int blockIndex = 0; blockIndex < numBlocks; ++blockIndex)
+	{
+		BlockData &block = document.Blocks[blockIndex];
+
+		if (block.BlockType == "NiMesh")
+		{
+			NiMesh *data = block.Data->Cast<NiMesh>();
+			ModelPackageNode &node = Package->Nodes[nodeIndices[data->BlockIndex]];
+
+			for (size_t i = 0; i < data->Modifiers.size(); ++i)
+			{
+				if (data->Modifiers[i]->BlockType == "NiSkinningMeshModifier")
+				{
+					const BlockData *skinBlock = data->Modifiers[i];
+					NiSkinningMeshModifier *skinData = skinBlock->Data->Cast<NiSkinningMeshModifier>();
+					size_t skinRootIndex = nodeIndices[skinData->SkeletonRoot->BlockIndex];
+
+					for (size_t j = 0; j < skinData->Bones.size(); ++j)
+					{
+						const BlockData *boneData = skinData->Bones[j];
+						size_t boneIndex = nodeIndices[boneData->BlockIndex];
+
+						MarkBone(boneIndex, boneIndices);
+
+						node.Bones.push_back(boneIndices[boneIndex]);
+					}
+				}
+			}
+		}
+	}
+
+	for (size_t i = 0; i < Package->Animations.size(); ++i)
+	{
+		auto &animation = Package->Animations[i];
+
+		for (size_t j = 0; j < animation.Nodes.size(); ++j)
+		{
+			animation.NodeMap[animation.Nodes[j].NodeName] = &animation.Nodes[j];
+		}
+	}
+
+	for (size_t i = 0; i < Package->Nodes.size(); ++i)
+		if (Package->Nodes[i].AttachedTo != (size_t)-1)
+			Package->Nodes[i].Transform->SetParent(Package->Nodes[Package->Nodes[i].AttachedTo].Transform);
+}
+
+void NifParser::MarkBone(size_t index, std::unordered_map<size_t, size_t> &boneIndices)
+{
+	if (Package->Nodes[index].IsInBoneList)
+		return;
+
+	boneIndices[index] = Package->Bones.size();
+	Package->Bones.push_back(index);
+	Package->Nodes[index].IsBone = true;
+	Package->Nodes[index].IsInBoneList = true;
+
+	for (size_t parent = Package->Nodes[index].AttachedTo; parent != (size_t)-1 && !Package->Nodes[parent].IsBone; parent = Package->Nodes[parent].AttachedTo)
+	{
+		Package->Nodes[parent].IsBone = true;
+	}
+}
+
+std::unordered_set<std::string> NifParser::SemanticsFound = {};
